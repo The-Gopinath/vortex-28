@@ -1,0 +1,16 @@
+# ===== Node.js =====
+node_modules/
+**/node_modules/
+
+# ===== Env files =====
+.env
+.env.*
+
+# ===== Python =====
+__pycache__/
+*.pyc
+venv/
+
+# ===== Build / cache =====
+.cache/
+.insightface/
