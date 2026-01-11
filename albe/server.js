@@ -1,20 +1,26 @@
 require("dotenv").config();
+
 const express = require("express");
 const mqtt = require("mqtt");
-const { Web3 } = require("web3"); // ✅ FIXED: Destructuring import
+const { Web3 } = require("web3");
 const cors = require("cors");
-const ABI = require("../access-logger/build/contracts/AccessLogger.json").abi ; 
+const axios = require("axios");
+
+const ABI = require("../access-logger/build/contracts/AccessLogger.json").abi;
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
-// ===== BLOCKCHAIN SETUP =====
-const web3 = new Web3("http://127.0.0.1:7545"); // ✅ Now works!
-const CONTRACT_ADDRESS ="0xE38a19117595de3979A68D47a0c30fdd676AeA32";
-const PRIVATE_KEY = "0xe7a3bb0596a4ca2f3331150bb84b8ba4e1939404c65386e51b0e93fb65e42c89";
+const fs = require("fs");
+const path = require("path");
 
-
+// ======================================================
+// BLOCKCHAIN SETUP
+// ======================================================
+const web3 = new Web3("http://127.0.0.1:7545"); // Ganache
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
+const PRIVATE_KEY = process.env.BACKEND_PRIVATE_KEY;
 
 let accessLogger;
 let backendAccount;
@@ -24,164 +30,228 @@ async function initBlockchain() {
     const account = web3.eth.accounts.privateKeyToAccount(PRIVATE_KEY);
     backendAccount = account.address;
     web3.eth.accounts.wallet.add(account);
+
     accessLogger = new web3.eth.Contract(ABI, CONTRACT_ADDRESS);
-    
+
     console.log("✓ Backend account:", backendAccount);
-    console.log("✓ Contract address:", CONTRACT_ADDRESS);
-    console.log("💰 Balance:", web3.utils.fromWei(await web3.eth.getBalance(backendAccount), 'ether'), "ETH");
-  } catch (error) {
-    console.error("❌ Blockchain init failed:", error.message);
+    console.log("✓ Contract:", CONTRACT_ADDRESS);
+    console.log(
+      "💰 Balance:",
+      web3.utils.fromWei(await web3.eth.getBalance(backendAccount), "ether"),
+      "ETH"
+    );
+  } catch (err) {
+    console.error("❌ Blockchain init failed:", err.message);
     process.exit(1);
   }
 }
 
-// ===== PYTHON API INTEGRATION =====
-const axios = require("axios");
 
-// ===== FIXED: Python /verify (only img_hex) =====
-async function verifyFaceWithPython(liveImageHex) {
+// ======================================================
+// PYTHON FACE API
+// ======================================================
+async function verifyFaceWithPython(imgId, maxWaitMs = 20000, pollIntervalMs = 500) {
+  const start = Date.now();
+
   try {
-    console.log("🔗 Calling Python /verify...");
-    
-    const response = await axios.post("http://localhost:5000/verify", {
-      img_hex: liveImageHex
-    }, { 
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000 
-    });
+    // 1️⃣ WAIT until Python confirms image exists
+    while (Date.now() - start < maxWaitMs) {
+      const statusRes = await axios.get(
+        `http://localhost:5000/status/${imgId}`,
+        { timeout: 5000 }
+      );
 
-    // ✅ FIXED: Python returns "score", backend expects "similarity"
-    const { user_id, score } = response.data;
-    const similarity = score * 100; // ✅ Convert 0.85 → 85%
-    
-    console.log(`   Python: user_id=${user_id}, similarity=${similarity.toFixed(1)}%`);
+      const { exists } = statusRes.data;
+
+      if (exists) {
+        console.log(`✅ Image ${imgId} exists in Python`);
+        break;
+      }
+
+      console.log(`⏳ Waiting for Python image ${imgId}...`);
+      await new Promise(res => setTimeout(res, pollIntervalMs));
+    }
+
+    // Final check
+    const finalStatus = await axios.get(
+      `http://localhost:5000/status/${imgId}`,
+      { timeout: 5000 }
+    );
+
+    if (!finalStatus.data.exists) {
+      console.log(`❌ Image ${imgId} still not found after waiting`);
+      return {
+        matched: false,
+        userId: "IMAGE_TIMEOUT",
+        similarity: 0
+      };
+    }
+
+    // 2️⃣ Verify face (Python reads image itself)
+    const verifyRes = await axios.post(
+      "http://localhost:5000/verify",
+      { img_id: imgId },
+      { timeout: 15000 }
+    );
+
+    const { user_id, score } = verifyRes.data;
+    const similarity = (score || 0) * 100;
 
     if (user_id !== -1 && similarity >= 60) {
       return {
         matched: true,
-        userId: `USER_${user_id.toString().padStart(3, '0')}`,
-        similarity: similarity
-      };
-    } else {
-      return {
-        matched: false,
-        userId: "UNKNOWN_USER",
-        similarity: similarity
+        userId: `USER_${user_id.toString().padStart(3, "0")}`,
+        similarity
       };
     }
-  } catch (error) {
-    console.error("❌ Python /verify failed:", error.response?.data || error.message);
-    return { matched: false, userId: "PYTHON_ERROR", similarity: 0 };
+
+    return {
+      matched: false,
+      userId: "UNKNOWN_USER",
+      similarity
+    };
+
+  } catch (err) {
+    console.error("❌ Python verify flow failed:", err.message);
+    return {
+      matched: false,
+      userId: "PYTHON_ERROR",
+      similarity: 0
+    };
   }
 }
 
 
-async function registerUserWithPython(userId, referenceImageHex) {
-  try {
-    console.log(`🔗 Calling Python /add for ${userId}...`);
-    
-    // ✅ FIXED: Matches VerifyRequest (img_hex only)
-    const response = await axios.post("http://localhost:5000/add", {
-      img_hex: referenceImageHex  // ← Single field (Python ignores user_id)
-    }, { 
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000 
-    });
 
-    console.log("✓ Python /add success:", response.data);
-    return response.data.success;  // ✅ Use Python response
-  } catch (error) {
-    console.error("❌ Python /add failed:", error.response?.data || error.message);
+async function registerUserWithPython(imageHex) {
+  try {
+    const res = await axios.post(
+      "http://localhost:5000/add",
+      { img_id: imageHex },
+      { timeout: 10000 }
+    );
+    return res.data.success === true;
+  } catch (err) {
+    console.error("❌ Python /add failed:", err.message);
     return false;
   }
 }
 
-
-// ===== MQTT HANDLER =====
-const BROKER = "broker.hivemq.com";
-const PORT_1 = 8883;
+// ======================================================
+// MQTT (HIVEMQ CLOUD – TLS)
+// ======================================================
+const MQTT_BROKER = process.env.MQTT_BROKER;
+const MQTT_PORT = process.env.MQTT_PORT;
+const MQTT_USERNAME = process.env.MQTT_USERNAME;
+const MQTT_PASSWORD = process.env.MQTT_PASSWORD;
 const TOPIC = "iot/camera/rfid_access";
 
-const mqttClient = mqtt.connect(`mqtt://${BROKER}:${PORT_1}`);
+const mqttClient = mqtt.connect({
+  host: MQTT_BROKER,
+  port: MQTT_PORT,
+  protocol: "mqtts",
+  username: MQTT_USERNAME,
+  password: MQTT_PASSWORD,
+  rejectUnauthorized: true,
+});
 
 mqttClient.on("connect", () => {
-  console.log(`✓ MQTT Connected: ${BROKER}:${PORT_1}`);
-  mqttClient.subscribe(TOPIC);  // Your topic
-  console.log(`📡 Subscribed: ${TOPIC}`);
+  console.log(`✓ MQTT Connected (TLS): ${MQTT_BROKER}:${MQTT_PORT}`);
+  mqttClient.subscribe(TOPIC);
 });
+
+mqttClient.on("error", (err) => {
+  console.error("❌ MQTT Error:", err.message);
+});
+
+async function imagePathToHex(imgId, retries = 10, delayMs = 300) {
+  const baseDir = path.resolve(__dirname, "..", "backend_py", "images");
+  const exts = [".jpg", ".jpeg", ".png"];
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    for (const ext of exts) {
+      const fullPath = path.join(baseDir, imgId + ext);
+      if (fs.existsSync(fullPath)) {
+        console.log("📸 Image found:", fullPath);
+        return fs.readFileSync(fullPath).toString("hex");
+      }
+    }
+
+    console.log(`⏳ Waiting for image ${imgId} (attempt ${attempt}/${retries})`);
+    await new Promise(res => setTimeout(res, delayMs));
+  }
+
+  throw new Error(`Image not found after waiting: ${imgId}`);
+}
+
 
 mqttClient.on("message", async (topic, message) => {
   try {
-    console.log(`\n📨 MQTT [${new Date().toISOString()}]`);
     const data = JSON.parse(message.toString());
-    
-    // ✅ NEW PAYLOAD FORMAT
-    const { name_of_device, timestamp, rfid_status, hex_code } = data;
+    const { name_of_device, rfid_status, img_id } = data;
+
     const deviceId = name_of_device;
-    const liveImageHex = hex_code;
     const rfidMatched = rfid_status;
 
-    console.log(`   Device: ${deviceId} | RFID: ${rfidMatched}`);
-
-    // RFID check
     if (!rfidMatched) {
-      console.log("❌ No RFID");
       const tx = await accessLogger.methods
         .logAccessAttempt("NO_RFID_CARD", deviceId, false, false, false)
         .send({ from: backendAccount, gas: 500000 });
-      
-      mqttClient.publish(`${TOPIC}/response/${deviceId}`, JSON.stringify({
-        granted: false, 
-        userId: "NO_RFID_CARD", 
-        reason: "RFID missing",
-        txHash: tx.transactionHash, 
-        timestamp: new Date().toISOString()
-      }));
+
+      mqttClient.publish(
+        `${TOPIC}/response/${deviceId}`,
+        JSON.stringify({
+          access_status: false,
+          reason: "RFID missing",
+          blockchain_tx: tx.transactionHash,
+        })
+      );
       return;
     }
 
-    // Python face verification
-    const matchResult = await verifyFaceWithPython(liveImageHex);
-    const imageMatched = matchResult.matched;
-    const accessGranted = rfidMatched && imageMatched;
+    const faceResult = await verifyFaceWithPython(img_id);
+    const accessGranted = rfidMatched && faceResult.matched;
 
-    console.log(`   Face: ${matchResult.userId} (${matchResult.similarity}%)`);
-    console.log(`   Access: ${accessGranted ? "✅ GRANTED" : "❌ DENIED"}`);
-
-    // Blockchain log
     const tx = await accessLogger.methods
-      .logAccessAttempt(matchResult.userId, deviceId, rfidMatched, imageMatched, accessGranted)
+      .logAccessAttempt(
+        faceResult.userId,
+        deviceId,
+        rfidMatched,
+        faceResult.matched,
+        accessGranted
+      )
       .send({ from: backendAccount, gas: 500000 });
 
-    console.log(`✓ TX: ${tx.transactionHash}`);
-
-    // Response back to device (NEW format)
-    mqttClient.publish(`${TOPIC}/response/${deviceId}`, JSON.stringify({
-      access_status: accessGranted,           // ✅ Your format
-      matched_user: matchResult.userId,       // ✅ Your format
-      face_similarity: matchResult.similarity,
-      rfid_status: rfidMatched,
-      face_status: imageMatched,
-      blockchain_tx: tx.transactionHash,
-      timestamp: new Date().toISOString()
-    }));
+    mqttClient.publish(
+      `${TOPIC}/response/${deviceId}`,
+      JSON.stringify({
+        access_status: accessGranted,
+        matched_user: faceResult.userId,
+        face_similarity: faceResult.similarity,
+        rfid_status: rfidMatched,
+        face_status: faceResult.matched,
+        blockchain_tx: tx.transactionHash,
+        timestamp: new Date().toISOString(),
+      })
+    );
   } catch (err) {
-    console.error("❌ MQTT Error:", err.message);
+    console.error("❌ MQTT Message Error:", err.message);
   }
 });
 
-
-// ===== API ENDPOINTS =====
+// ======================================================
+// API ROUTES
+// ======================================================
 app.get("/api/logs", async (req, res) => {
   try {
     const logs = await accessLogger.methods.getAllAccessLogs().call();
-    const formatted = logs.map(log => ({
-      userId: log.userId,
-      deviceId: log.deviceId,
-      time: new Date(Number(log.timestamp) * 1000).toLocaleString(),
-      rfidMatched: log.rfidMatched,
-      imageMatched: log.imageMatched,
-      accessGranted: log.accessGranted
+    const formatted = logs.map((l) => ({
+      userId: l.userId,
+      deviceId: l.deviceId,
+      time: new Date(Number(l.timestamp) * 1000).toLocaleString(),
+      rfidMatched: l.rfidMatched,
+      imageMatched: l.imageMatched,
+      accessGranted: l.accessGranted,
     }));
     res.json({ success: true, logs: formatted.reverse() });
   } catch (err) {
@@ -189,106 +259,32 @@ app.get("/api/logs", async (req, res) => {
   }
 });
 
-// app.post("/api/admin/register-user", async (req, res) => {
-//   try {
-//     const { userId, referenceImage, adminAddress } = req.body;
-
-//     if (!userId || !referenceImage || !adminAddress) {
-//       return res.status(400).json({ error: "Missing data" });
-//     }
-
-//     // Admin verification
-//     const contractAdmin = await accessLogger.methods.getAdmin().call();
-//     if (adminAddress.toLowerCase() !== contractAdmin.toLowerCase()) {
-//       return res.status(403).json({ error: "Admin only" });
-//     }
-
-//     // Base64 → Hex
-//     const base64Data = referenceImage.replace(/^data:image\/\w+;base64,/, "");
-//     const buffer = Buffer.from(base64Data, 'base64');
-//     const imageHex = buffer.toString('hex');
-
-//     // Python registration
-//     const success = await registerUserWithPython(userId, imageHex);
-//     if (!success) {
-//       return res.status(500).json({ error: "Python registration failed" });
-//     }
-
-//     res.json({ 
-//       success: true, 
-//       message: `User ${userId} registered in Supabase!` 
-//     });
-//   } catch (err) {
-//     res.status(500).json({ success: false, error: err.message });
-//   }
-// });
-
 app.post("/api/admin/register-user", async (req, res) => {
   try {
-    const { userId, referenceImage, adminAddress } = req.body;
-    console.log("🆕 Register attempt:", { userId, adminAddress }); // ✅ DEBUG
+    const { referenceImage, adminAddress } = req.body;
 
-    if (!userId || !referenceImage || !adminAddress) {
-      console.log("❌ Missing fields");
-      return res.status(400).json({ error: "Missing userId/image/adminAddress" });
-    }
-
-    // Admin verification
     const contractAdmin = await accessLogger.methods.getAdmin().call();
-    console.log("🔑 Contract admin:", contractAdmin);
-    console.log("👤 Request admin:", adminAddress);
-    
     if (adminAddress.toLowerCase() !== contractAdmin.toLowerCase()) {
-      console.log("❌ Admin mismatch");
-      return res.status(403).json({ error: "Only admin can register users" });
+      return res.status(403).json({ error: "Admin only" });
     }
 
-    // ✅ FIXED: Safe Base64 → Hex
-    let imageHex;
-    try {
-      const base64Data = referenceImage.replace(/^data:image\/[a-zA-Z]+;base64,/, "");
-      const buffer = Buffer.from(base64Data, 'base64');
-      imageHex = buffer.toString('hex');
-      console.log("📸 Image hex length:", imageHex.length);
-    } catch (hexError) {
-      console.error("❌ Hex conversion failed:", hexError.message);
-      return res.status(500).json({ error: "Invalid image format" });
+    const base64 = referenceImage.replace(/^data:image\/\w+;base64,/, "");
+    const imageHex = Buffer.from(base64, "base64").toString("hex");
+
+    const success = await registerUserWithPython(imageHex);
+    if (!success) {
+      return res.status(500).json({ error: "Python registration failed" });
     }
 
-    // Python registration
-    const pythonSuccess = await registerUserWithPython(userId, imageHex);
-    if (!pythonSuccess) {
-      console.error("❌ Python failed");
-      return res.status(500).json({ error: "Supabase registration failed" });
-    }
-
-    console.log("✅ User registered:", userId);
-    res.json({ 
-      success: true, 
-      message: `User ${userId} registered successfully!`,
-      userId,
-      python: true
-    });
+    res.json({ success: 1 });
   } catch (err) {
-    console.error("💥 FULL ERROR:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-
-app.get("/api/admin/users", (req, res) => {
-  res.json({ 
-    success: true, 
-    message: "Users in Python/Supabase", 
-    users: [],
-    python: "localhost:5000/add"
-  });
-});
-
-// ===== START SERVER =====
 const PORT = process.env.PORT || 3001;
+
 app.listen(PORT, async () => {
   await initBlockchain();
-  console.log(`\n✅ Backend: http://localhost:${PORT}`);
-  console.log(`🔗 Python: localhost:5000/verify,/add`);
+  console.log(`✅ Backend running: http://localhost:${PORT}`);
 });
